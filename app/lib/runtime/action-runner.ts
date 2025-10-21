@@ -39,25 +39,20 @@ class ActionCommandError extends Error {
   readonly _header: string;
 
   constructor(message: string, output: string) {
-    // Create a formatted message that includes both the error message and output
     const formattedMessage = `Failed To Execute Shell Command: ${message}\n\nOutput:\n${output}`;
     super(formattedMessage);
 
-    // Set the output separately so it can be accessed programmatically
     this._header = message;
     this._output = output;
 
-    // Maintain proper prototype chain
     Object.setPrototypeOf(this, ActionCommandError.prototype);
-
-    // Set the name of the error for better debugging
     this.name = 'ActionCommandError';
   }
 
-  // Optional: Add a method to get just the terminal output
   get output() {
     return this._output;
   }
+  
   get header() {
     return this._header;
   }
@@ -95,7 +90,6 @@ export class ActionRunner {
     const action = actions[actionId];
 
     if (action) {
-      // action already added
       return;
     }
 
@@ -126,11 +120,11 @@ export class ActionRunner {
     }
 
     if (action.executed) {
-      return; // No return value here
+      return;
     }
 
     if (isStreaming && action.type !== 'file') {
-      return; // No return value here
+      return;
     }
 
     this.#updateAction(actionId, { ...action, ...data.action, executed: !isStreaming });
@@ -167,27 +161,20 @@ export class ActionRunner {
           try {
             await this.handleSupabaseAction(action as SupabaseAction);
           } catch (error: any) {
-            // Update action status
             this.#updateAction(actionId, {
               status: 'failed',
               error: error instanceof Error ? error.message : 'Supabase action failed',
             });
-
-            // Return early without re-throwing
             return;
           }
           break;
         }
         case 'build': {
           const buildOutput = await this.#runBuildAction(action);
-
-          // Store build output for deployment
           this.buildOutput = buildOutput;
           break;
         }
         case 'start': {
-          // making the start app non blocking
-
           this.#runStartAction(action)
             .then(() => this.#updateAction(actionId, { status: 'complete' }))
             .catch((err: Error) => {
@@ -210,12 +197,7 @@ export class ActionRunner {
               });
             });
 
-          /*
-           * adding a delay to avoid any race condition between 2 start actions
-           * i am up for a better approach
-           */
           await new Promise((resolve) => setTimeout(resolve, 2000));
-
           return;
         }
       }
@@ -242,7 +224,6 @@ export class ActionRunner {
         content: error.output,
       });
 
-      // re-throw the error to be caught in the promise chain
       throw error;
     }
   }
@@ -259,7 +240,6 @@ export class ActionRunner {
       unreachable('Shell terminal not found');
     }
 
-    // Pre-validate command for common issues
     const validationResult = await this.#validateShellCommand(action.content);
 
     if (validationResult.shouldModify && validationResult.modifiedCommand) {
@@ -317,8 +297,6 @@ export class ActionRunner {
     const relativePath = nodePath.relative(webcontainer.workdir, action.filePath);
 
     let folder = nodePath.dirname(relativePath);
-
-    // remove trailing slashes
     folder = folder.replace(/\/+$/g, '');
 
     if (folder !== '.') {
@@ -340,7 +318,6 @@ export class ActionRunner {
 
   #updateAction(id: string, newState: ActionStateUpdate) {
     const actions = this.actions.get();
-
     this.actions.setKey(id, { ...actions[id], ...newState });
   }
 
@@ -349,7 +326,6 @@ export class ActionRunner {
       const webcontainer = await this.#webcontainer;
       const historyPath = this.#getHistoryPath(filePath);
       const content = await webcontainer.fs.readFile(historyPath, 'utf-8');
-
       return JSON.parse(content);
     } catch (error) {
       logger.error('Failed to get file history:', error);
@@ -358,7 +334,6 @@ export class ActionRunner {
   }
 
   async saveFileHistory(filePath: string, history: FileHistory) {
-    // const webcontainer = await this.#webcontainer;
     const historyPath = this.#getHistoryPath(filePath);
 
     await this.#runFileAction({
@@ -373,10 +348,15 @@ export class ActionRunner {
     return nodePath.join('.history', filePath);
   }
 
+  // ============================================================================
+  // ✅ FIXED BUILD ACTION WITH PROPER FILESYSTEM SYNC
+  // ============================================================================
   async #runBuildAction(action: ActionState) {
     if (action.type !== 'build') {
       unreachable('Expected build action');
     }
+
+    logger.info('🔍 Step 0: Checking dependencies...');
 
     // Trigger build started alert
     this.onDeployAlert?.({
@@ -391,7 +371,58 @@ export class ActionRunner {
 
     const webcontainer = await this.#webcontainer;
 
-    // Create a new terminal specifically for the build
+    // ✅ FIX 1: Check if node_modules exists, install if missing
+    try {
+      await webcontainer.fs.readdir('node_modules');
+      logger.debug('✅ node_modules exists');
+    } catch {
+      logger.warn('⚠️ node_modules does not exist');
+      logger.info('📦 Installing dependencies...');
+      
+      const installProcess = await webcontainer.spawn('npm', ['install']);
+      
+      let installOutput = '';
+      installProcess.output.pipeTo(
+        new WritableStream({
+          write(data) {
+            installOutput += data;
+          },
+        }),
+      );
+      
+      const installExitCode = await installProcess.exit;
+      
+      if (installExitCode !== 0) {
+        throw new ActionCommandError('Dependency Installation Failed', installOutput || 'No Output Available');
+      }
+      
+      logger.info('✅ Dependencies installed successfully');
+    }
+
+    // ✅ FIX 2: Fix build script if needed (remove tsc for WebContainer compatibility)
+    logger.info('🔧 Step 1: Fixing build script...');
+    try {
+      const packageJsonContent = await webcontainer.fs.readFile('package.json', 'utf-8');
+      const packageJson = JSON.parse(packageJsonContent);
+      
+      if (packageJson.scripts?.build?.includes('tsc')) {
+        logger.info('Detected tsc in build script, removing for WebContainer compatibility');
+        
+        // Remove tsc from build script
+        const originalBuild = packageJson.scripts.build;
+        packageJson.scripts.build = originalBuild.replace(/tsc\s*&&?\s*/g, '').trim();
+        
+        logger.info(`Build script fixed: "${originalBuild}" → "${packageJson.scripts.build}"`);
+        
+        // Write updated package.json
+        await webcontainer.fs.writeFile('package.json', JSON.stringify(packageJson, null, 2));
+      }
+    } catch (error) {
+      logger.warn('Could not check/fix build script:', error);
+    }
+
+    // ✅ FIX 3: Run the build with proper output capture
+    logger.info('🔨 Step 2: Running build...');
     const buildProcess = await webcontainer.spawn('npm', ['run', 'build']);
 
     let output = '';
@@ -404,9 +435,9 @@ export class ActionRunner {
     );
 
     const exitCode = await buildProcess.exit;
+    logger.info('✅ Build completed successfully');
 
     if (exitCode !== 0) {
-      // Trigger build failed alert
       this.onDeployAlert?.({
         type: 'error',
         title: 'Build Failed',
@@ -421,7 +452,87 @@ export class ActionRunner {
       throw new ActionCommandError('Build Failed', output || 'No Output Available');
     }
 
-    // Trigger build success alert
+    // ✅ FIX 4: Wait for filesystem to sync BEFORE checking for build output
+    logger.info('⏳ Waiting for build files to be written...');
+    await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay for filesystem sync
+
+    // ✅ FIX 5: Comprehensive build directory detection with verification
+    logger.info('🔍 Step 3: Searching for build output directory...');
+    const commonBuildDirs = ['dist', 'build', 'out', 'output', '.next', 'public'];
+    
+    let buildDir = '';
+    let foundIndexHtml = false;
+
+    // Try to find build directory with index.html
+    for (const dir of commonBuildDirs) {
+      try {
+        const files = await webcontainer.fs.readdir(dir);
+        logger.debug(`✅ Found directory: ${dir} with ${files.length} files`);
+        
+        // Check if index.html exists in this directory
+        try {
+          await webcontainer.fs.readFile(`${dir}/index.html`, 'utf-8');
+          buildDir = dir;
+          foundIndexHtml = true;
+          logger.info(`✅ Found build output: ${dir}/index.html`);
+          break;
+        } catch {
+          logger.debug(`⚠️ ${dir} exists but no index.html found`);
+          // Directory exists but no index.html, keep looking
+          if (!buildDir) {
+            buildDir = dir; // Use as fallback
+          }
+        }
+      } catch {
+        logger.debug(`❌ Directory does not exist: ${dir}`);
+        continue;
+      }
+    }
+
+    // ✅ FIX 6: Enhanced error reporting if no build output found
+    if (!buildDir || !foundIndexHtml) {
+      // Perform manual verification
+      logger.warn('⚠️ Auto-detection failed, performing manual verification...');
+      
+      let manualCheckResult = 'No valid build directory found after thorough search';
+      const checkedDirs: string[] = [];
+      
+      for (const dir of commonBuildDirs) {
+        try {
+          await webcontainer.fs.readdir(dir);
+          checkedDirs.push(`${dir}: exists but missing index.html`);
+        } catch {
+          checkedDirs.push(`${dir}: does not exist`);
+        }
+      }
+      
+      logger.error('❌ No valid build directory found after thorough search');
+      logger.info('📋 Checked directories:', commonBuildDirs.join(', '));
+      
+      checkedDirs.forEach(result => {
+        logger.error(`   ${result}`);
+      });
+      
+      logger.error('📝 Build output:', output.slice(-500)); // Last 500 chars
+      
+      const errorDetails = `Build completed (exit code: 0) but no index.html found.
+
+Checked directories: ${commonBuildDirs.join(', ')}
+
+${checkedDirs.map(r => `   ${r}`).join('\n')}
+
+This usually means:
+1. vite.config.ts has incorrect outDir
+2. Build failed silently
+3. Files were written to unexpected location
+
+Build output:
+${output.slice(-1000)}`;
+
+      throw new ActionCommandError('Build Output Missing', errorDetails);
+    }
+
+    // Success alert
     this.onDeployAlert?.({
       type: 'success',
       title: 'Build Completed',
@@ -432,35 +543,16 @@ export class ActionRunner {
       source: 'netlify',
     });
 
-    // Check for common build directories
-    const commonBuildDirs = ['dist', 'build', 'out', 'output', '.next', 'public'];
-
-    let buildDir = '';
-
-    // Try to find the first existing build directory
-    for (const dir of commonBuildDirs) {
-      const dirPath = nodePath.join(webcontainer.workdir, dir);
-
-      try {
-        await webcontainer.fs.readdir(dirPath);
-        buildDir = dirPath;
-        break;
-      } catch {
-        continue;
-      }
-    }
-
-    // If no build directory was found, use the default (dist)
-    if (!buildDir) {
-      buildDir = nodePath.join(webcontainer.workdir, 'dist');
-    }
+    const fullBuildPath = nodePath.join(webcontainer.workdir, buildDir);
+    logger.info(`✅ Build output verified: ${fullBuildPath}`);
 
     return {
-      path: buildDir,
+      path: fullBuildPath,
       exitCode,
       output,
     };
   }
+
   async handleSupabaseAction(action: SupabaseAction) {
     const { operation, content, filePath } = action;
     logger.debug('[Supabase Action]:', { operation, filePath, content });
@@ -471,7 +563,6 @@ export class ActionRunner {
           throw new Error('Migration requires a filePath');
         }
 
-        // Show alert for migration action
         this.onSupabaseAlert?.({
           type: 'info',
           title: 'Supabase Migration',
@@ -480,7 +571,6 @@ export class ActionRunner {
           source: 'supabase',
         });
 
-        // Only create the migration file
         await this.#runFileAction({
           type: 'file',
           filePath,
@@ -490,7 +580,6 @@ export class ActionRunner {
         return { success: true };
 
       case 'query': {
-        // Always show the alert and let the SupabaseAlert component handle connection state
         this.onSupabaseAlert?.({
           type: 'info',
           title: 'Supabase Query',
@@ -499,7 +588,6 @@ export class ActionRunner {
           source: 'supabase',
         });
 
-        // The actual execution will be triggered from SupabaseChatAlert
         return { pending: true };
       }
 
@@ -508,7 +596,6 @@ export class ActionRunner {
     }
   }
 
-  // Add this method declaration to the class
   handleDeployAction(
     stage: 'building' | 'deploying' | 'complete',
     status: ActionStatus,
@@ -566,14 +653,12 @@ export class ActionRunner {
   }> {
     const trimmedCommand = command.trim();
 
-    // Handle rm commands that might fail due to missing files
     if (trimmedCommand.startsWith('rm ') && !trimmedCommand.includes(' -f')) {
       const rmMatch = trimmedCommand.match(/^rm\s+(.+)$/);
 
       if (rmMatch) {
         const filePaths = rmMatch[1].split(/\s+/);
 
-        // Check if any of the files exist using WebContainer
         try {
           const webcontainer = await this.#webcontainer;
           const existingFiles = [];
@@ -581,25 +666,23 @@ export class ActionRunner {
           for (const filePath of filePaths) {
             if (filePath.startsWith('-')) {
               continue;
-            } // Skip flags
+            }
 
             try {
               await webcontainer.fs.readFile(filePath);
               existingFiles.push(filePath);
             } catch {
-              // File doesn't exist, skip it
+              // File doesn't exist
             }
           }
 
           if (existingFiles.length === 0) {
-            // No files exist, modify command to use -f flag to avoid error
             return {
               shouldModify: true,
               modifiedCommand: `rm -f ${filePaths.join(' ')}`,
               warning: 'Added -f flag to rm command as target files do not exist',
             };
           } else if (existingFiles.length < filePaths.length) {
-            // Some files don't exist, modify to only remove existing ones with -f for safety
             return {
               shouldModify: true,
               modifiedCommand: `rm -f ${filePaths.join(' ')}`,
@@ -612,7 +695,6 @@ export class ActionRunner {
       }
     }
 
-    // Handle cd commands to non-existent directories
     if (trimmedCommand.startsWith('cd ')) {
       const cdMatch = trimmedCommand.match(/^cd\s+(.+)$/);
 
@@ -632,7 +714,6 @@ export class ActionRunner {
       }
     }
 
-    // Handle cp/mv commands with missing source files
     if (trimmedCommand.match(/^(cp|mv)\s+/)) {
       const parts = trimmedCommand.split(/\s+/);
 
@@ -665,7 +746,6 @@ export class ActionRunner {
     const trimmedCommand = command.trim();
     const firstWord = trimmedCommand.split(/\s+/)[0];
 
-    // Common error patterns and their explanations
     const errorPatterns = [
       {
         pattern: /cannot remove.*No such file or directory/,
@@ -673,7 +753,6 @@ export class ActionRunner {
         getMessage: () => {
           const fileMatch = output?.match(/'([^']+)'/);
           const fileName = fileMatch ? fileMatch[1] : 'file';
-
           return `The file '${fileName}' does not exist and cannot be removed.\n\nSuggestion: Use 'ls' to check what files exist, or use 'rm -f' to ignore missing files.`;
         },
       },
@@ -684,10 +763,8 @@ export class ActionRunner {
           if (trimmedCommand.startsWith('cd ')) {
             const dirMatch = trimmedCommand.match(/cd\s+(.+)/);
             const dirName = dirMatch ? dirMatch[1] : 'directory';
-
             return `The directory '${dirName}' does not exist.\n\nSuggestion: Use 'mkdir -p ${dirName}' to create it first, or check available directories with 'ls'.`;
           }
-
           return `The specified file or directory does not exist.\n\nSuggestion: Check the path and use 'ls' to see available files.`;
         },
       },
@@ -716,7 +793,6 @@ export class ActionRunner {
       },
     ];
 
-    // Try to match known error patterns
     for (const errorPattern of errorPatterns) {
       if (output && errorPattern.pattern.test(output)) {
         return {
@@ -726,7 +802,6 @@ export class ActionRunner {
       }
     }
 
-    // Generic error with suggestions based on command type
     let suggestion = '';
 
     if (trimmedCommand.startsWith('npm ')) {
