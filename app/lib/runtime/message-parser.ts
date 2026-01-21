@@ -1,3 +1,5 @@
+// app/lib/runtime/message-parser.ts
+
 import type { ActionType, BoltAction, BoltActionData, FileAction, ShellAction, SupabaseAction } from '~/types/actions';
 import type { BoltArtifactData } from '~/types/artifact';
 import { createScopedLogger } from '~/utils/logger';
@@ -27,12 +29,22 @@ export interface ActionCallbackData {
 export type ArtifactCallback = (data: ArtifactCallbackData) => void;
 export type ActionCallback = (data: ActionCallbackData) => void;
 
+// Callback for validation failures
+export type ValidationFailureCallback = (data: {
+  messageId: string;
+  actionId: string;
+  filePath: string;
+  error: string;
+  content: string;
+}) => void;
+
 export interface ParserCallbacks {
   onArtifactOpen?: ArtifactCallback;
   onArtifactClose?: ArtifactCallback;
   onActionOpen?: ActionCallback;
   onActionStream?: ActionCallback;
   onActionClose?: ActionCallback;
+  onValidationFailure?: ValidationFailureCallback;
 }
 
 interface ElementFactoryProps {
@@ -45,6 +57,7 @@ type ElementFactory = (props: ElementFactoryProps) => string;
 export interface StreamingMessageParserOptions {
   callbacks?: ParserCallbacks;
   artifactElement?: ElementFactory;
+  validateContent?: boolean;
 }
 
 interface MessageState {
@@ -55,16 +68,15 @@ interface MessageState {
   currentArtifact?: BoltArtifactData;
   currentAction: BoltActionData;
   actionId: number;
+  streamedContentLength: number;
 }
 
 function cleanoutMarkdownSyntax(content: string) {
   const codeBlockRegex = /^\s*```\w*\n([\s\S]*?)\n\s*```\s*$/;
   const match = content.match(codeBlockRegex);
 
-  // console.log('matching', !!match, content);
-
   if (match) {
-    return match[1]; // Remove common leading 4-space indent
+    return match[1];
   } else {
     return content;
   }
@@ -73,11 +85,20 @@ function cleanoutMarkdownSyntax(content: string) {
 function cleanEscapedTags(content: string) {
   return content.replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 }
+
+/**
+ * StreamingMessageParser - Parses streaming messages with artifact and action tags
+ * 
+ * This is the main parser class used throughout the application.
+ */
 export class StreamingMessageParser {
   #messages = new Map<string, MessageState>();
   #artifactCounter = 0;
+  #validateContent: boolean;
 
-  constructor(private _options: StreamingMessageParserOptions = {}) {}
+  constructor(private _options: StreamingMessageParserOptions = {}) {
+    this.#validateContent = _options.validateContent ?? false;
+  }
 
   parse(messageId: string, input: string) {
     let state = this.#messages.get(messageId);
@@ -90,6 +111,7 @@ export class StreamingMessageParser {
         artifactCounter: 0,
         currentAction: { content: '' },
         actionId: 0,
+        streamedContentLength: 0,
       };
 
       this.#messages.set(messageId, state);
@@ -100,13 +122,12 @@ export class StreamingMessageParser {
     let earlyBreak = false;
 
     while (i < input.length) {
+      // Quick actions handling
       if (input.startsWith(BOLT_QUICK_ACTIONS_OPEN, i)) {
         const actionsBlockEnd = input.indexOf(BOLT_QUICK_ACTIONS_CLOSE, i);
 
         if (actionsBlockEnd !== -1) {
           const actionsBlockContent = input.slice(i + BOLT_QUICK_ACTIONS_OPEN.length, actionsBlockEnd);
-
-          // Find all <bolt-quick-action ...>label</bolt-quick-action> inside
           const quickActionRegex = /<bolt-quick-action([^>]*)>([\s\S]*?)<\/bolt-quick-action>/g;
           let match;
           const buttons = [];
@@ -140,22 +161,45 @@ export class StreamingMessageParser {
 
         if (state.insideAction) {
           const closeIndex = input.indexOf(ARTIFACT_ACTION_TAG_CLOSE, i);
-
           const currentAction = state.currentAction;
 
           if (closeIndex !== -1) {
-            currentAction.content += input.slice(i, closeIndex);
+            // Add content from current position to close tag
+            const newContent = input.slice(i, closeIndex);
+            currentAction.content += newContent;
 
             let content = currentAction.content.trim();
 
             if ('type' in currentAction && currentAction.type === 'file') {
-              // Remove markdown code block syntax if present and file is not markdown
               if (!currentAction.filePath.endsWith('.md')) {
                 content = cleanoutMarkdownSyntax(content);
                 content = cleanEscapedTags(content);
               }
 
               content += '\n';
+
+              // Validate content if enabled
+              if (this.#validateContent && this._options.callbacks?.onValidationFailure) {
+                // Basic validation - check for obvious corruption
+                if (this.#isLikelyCorrupted(content)) {
+                  logger.warn(`⚠️ Possible corruption in file: ${currentAction.filePath}`);
+                  this._options.callbacks.onValidationFailure({
+                    messageId,
+                    actionId: String(state.actionId - 1),
+                    filePath: currentAction.filePath,
+                    error: 'Content appears corrupted',
+                    content: content.slice(0, 500),
+                  });
+                }
+              }
+
+              // Log content length mismatch (indicates streaming accumulation issue)
+              if (state.streamedContentLength > 0 && content.length < state.streamedContentLength * 0.9) {
+                logger.warn(
+                  `⚠️ Content length mismatch: streamed ${state.streamedContentLength} chars, ` +
+                  `final ${content.length} chars for ${currentAction.filePath || 'unknown'}`
+                );
+              }
             }
 
             currentAction.content = content;
@@ -163,24 +207,23 @@ export class StreamingMessageParser {
             this._options.callbacks?.onActionClose?.({
               artifactId: currentArtifact.id,
               messageId,
-
-              /**
-               * We decrement the id because it's been incremented already
-               * when `onActionOpen` was emitted to make sure the ids are
-               * the same.
-               */
               actionId: String(state.actionId - 1),
-
               action: currentAction as BoltAction,
             });
 
             state.insideAction = false;
             state.currentAction = { content: '' };
+            state.streamedContentLength = 0;
 
             i = closeIndex + ARTIFACT_ACTION_TAG_CLOSE.length;
           } else {
+            // Accumulate content during streaming
+            const streamContent = input.slice(i);
+            currentAction.content += streamContent;
+            state.streamedContentLength += streamContent.length;
+
             if ('type' in currentAction && currentAction.type === 'file') {
-              let content = input.slice(i);
+              let content = currentAction.content;
 
               if (!currentAction.filePath.endsWith('.md')) {
                 content = cleanoutMarkdownSyntax(content);
@@ -199,6 +242,7 @@ export class StreamingMessageParser {
               });
             }
 
+            i = input.length;
             break;
           }
         } else {
@@ -210,6 +254,7 @@ export class StreamingMessageParser {
 
             if (actionEndIndex !== -1) {
               state.insideAction = true;
+              state.streamedContentLength = 0;
 
               state.currentAction = this.#parseActionTag(input, actionOpenIndex, actionEndIndex);
 
@@ -262,8 +307,6 @@ export class StreamingMessageParser {
 
               const artifactTitle = this.#extractAttribute(artifactTag, 'title') as string;
               const type = this.#extractAttribute(artifactTag, 'type') as string;
-
-              // const artifactId = this.#extractAttribute(artifactTag, 'id') as string;
               const artifactId = `${messageId}-${state.artifactCounter++}`;
 
               if (!artifactTitle) {
@@ -313,10 +356,6 @@ export class StreamingMessageParser {
           break;
         }
       } else {
-        /*
-         * Note: Auto-file-creation from code blocks is now handled by EnhancedMessageParser
-         * to avoid duplicate processing and provide better shell command detection
-         */
         output += input[i];
         i++;
       }
@@ -333,6 +372,17 @@ export class StreamingMessageParser {
 
   reset() {
     this.#messages.clear();
+  }
+
+  #isLikelyCorrupted(content: string): boolean {
+    // Check for common corruption patterns
+    const corruptionPatterns = [
+      /[\x00-\x08\x0B\x0C\x0E-\x1F]/, // Control characters
+      /(.)\1{50,}/, // Same character repeated 50+ times
+      /<boltAction[^>]*>[^<]*<boltAction/, // Nested action tags
+    ];
+
+    return corruptionPatterns.some(pattern => pattern.test(content));
   }
 
   #parseActionTag(input: string, actionOpenIndex: number, actionEndIndex: number) {
@@ -386,6 +436,16 @@ export class StreamingMessageParser {
   }
 }
 
+// ============================================================================
+// BACKWARD COMPATIBILITY ALIAS
+// Some files import StreamingMessageParserPatched - keep that working
+// ============================================================================
+export { StreamingMessageParser as StreamingMessageParserPatched };
+
+// ============================================================================
+// ELEMENT FACTORIES
+// ============================================================================
+
 const createArtifactElement: ElementFactory = (props) => {
   const elementProps = [
     'class="__boltArtifact__"',
@@ -412,5 +472,5 @@ function createQuickActionElement(props: Record<string, string>, label: string) 
 }
 
 function createQuickActionGroup(buttons: string[]) {
-  return `<div class=\"__boltQuickAction__\" data-bolt-quick-action=\"true\">${buttons.join('')}</div>`;
+  return `<div class="__boltQuickAction__" data-bolt-quick-action="true">${buttons.join('')}</div>`;
 }
